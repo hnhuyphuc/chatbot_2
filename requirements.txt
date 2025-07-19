@@ -4,5 +4,6 @@ langchain-openai
 langchain-community
 streamlit
 pypdf
-faiss-cpu
 langdetect
+aiohttp
+supabase-client
