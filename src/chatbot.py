@@ -16,7 +16,7 @@ class Chatbot:
         self.llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
         
         # 3. Ngưỡng điểm để xác định độ liên quan. Càng thấp càng liên quan.
-        self.SCORE_THRESHOLD = 0.9
+        self.SCORE_THRESHOLD = 0.8
 
         # 4. Định nghĩa các câu trả lời và prompt mẫu
         self.NOT_FOUND_IN_SYLLABUS = "Tôi không tìm thấy thông tin về điều này trong tài liệu."
