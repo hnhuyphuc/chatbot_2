@@ -1,27 +1,40 @@
-from langchain_community.vectorstores import FAISS
+import os
+from dotenv import load_dotenv
+from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema.runnable import RunnablePassthrough
 from langchain.schema.output_parser import StrOutputParser
+from supabase import create_client, Client
 
-DB_PATH = "vector_store/"
+# Tải biến môi trường
+load_dotenv()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 class Chatbot:
     def __init__(self):
-        # 1. Tải Vector DB
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Vui lòng cung cấp SUPABASE_URL và SUPABASE_KEY trong file .env")
+
+        # 1. Khởi tạo các thành phần cần thiết
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-
-        # 2. Khởi tạo LLM
         self.llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-        
-        # 3. Ngưỡng điểm để xác định độ liên quan. Càng thấp càng liên quan.
-        self.SCORE_THRESHOLD = 0.8
+        supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # 4. Định nghĩa các câu trả lời và prompt mẫu
+        # 2. Kết nối tới Vector Store trên Supabase
+        self.vector_store = SupabaseVectorStore(
+            client=supabase_client,
+            embedding=embeddings,
+            table_name="documents",
+            query_name="match_documents"
+        )
+        self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
+        
+        # 3. Định nghĩa các câu trả lời và prompt mẫu
         self.NOT_FOUND_IN_SYLLABUS = "Tôi không tìm thấy thông tin về điều này trong tài liệu."
         
-        # Prompt cho RAG (Case 1 & 3)
         self.rag_prompt = PromptTemplate.from_template(
             "You are an AI assistant for answering questions about the ISTQB syllabus.\n"
             "Answer the question based ONLY on the context provided below.\n"
@@ -31,53 +44,51 @@ class Chatbot:
             "Helpful Answer:"
         )
         
-        # Prompt cho trường hợp hỏi đáp tổng quát (Case 2)
         self.general_prompt = PromptTemplate.from_template("Answer the following question concisely: {question}")
 
-    def answer(self, question):
+    def search_in_syllabus(self, question):
         """
-        Phân luồng câu trả lời theo logic mới:
-        1. Luôn tìm kiếm trong giáo trình trước.
-        2. Nếu không liên quan, mới dùng kiến thức chung của OpenAI.
+        Chỉ tìm kiếm câu trả lời trong giáo trình (Supabase).
+        Trả về kết quả nếu tìm thấy, ngược lại trả về None.
         """
-        # BƯỚC 1: LUÔN TÌM KIẾM TRONG GIÁO TRÌNH TRƯỚC
-        docs_with_scores = self.db.similarity_search_with_score(question, k=5)
-        
-        # Mặc định là không tìm thấy tài liệu liên quan
-        is_relevant = False
-        if docs_with_scores:
-            # Lấy điểm của tài liệu liên quan nhất
-            best_score = docs_with_scores[0][1]
-            if best_score < self.SCORE_THRESHOLD:
-                is_relevant = True
+        retrieved_docs = self.retriever.invoke(question)
 
-        if is_relevant:
-            # TRƯỜNG HỢP 1 hoặc 3: Câu hỏi có vẻ liên quan đến giáo trình
-            context = "\n\n".join([doc.page_content for doc, score in docs_with_scores])
-            
-            # SỬA LỖI: Định nghĩa chain một cách chính xác
-            rag_chain = (
-                self.rag_prompt
-                | self.llm
-                | StrOutputParser()
-            )
-            # SỬA LỖI: Gọi chain với dữ liệu đầu vào là một dictionary
+        if retrieved_docs:
+            context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+            rag_chain = (self.rag_prompt | self.llm | StrOutputParser())
             answer_text = rag_chain.invoke({"context": context, "question": question})
-            
-            # Kiểm tra xem LLM có thực sự tìm thấy câu trả lời trong ngữ cảnh không
-            if self.NOT_FOUND_IN_SYLLABUS in answer_text:
-                # Case 3: Thuộc giáo trình nhưng không tìm thấy thông tin cụ thể
-                return {"answer": self.NOT_FOUND_IN_SYLLABUS, "sources": []}
-            else:
-                # Case 1: Tìm thấy trong giáo trình
-                sources = [doc.metadata for doc, score in docs_with_scores]
-                return {"answer": answer_text, "sources": sources}
-        else:
-            # TRƯỜNG HỢP 2: Câu hỏi không liên quan đến giáo trình -> Dùng OpenAI
-            general_chain = self.general_prompt | self.llm | StrOutputParser()
-            answer_text = general_chain.invoke({"question": question})
 
-            return {
-                "answer": answer_text,
-                "sources": [{"source": "OpenAI", "page": None}] 
-            }
+            if self.NOT_FOUND_IN_SYLLABUS not in answer_text:
+                # Tìm thấy câu trả lời hợp lệ trong ngữ cảnh
+                sources = [doc.metadata for doc in retrieved_docs]
+                return {"answer": answer_text, "sources": sources}
+        
+        # Nếu không tìm thấy tài liệu hoặc LLM không tìm thấy câu trả lời
+        return None
+
+    def search_with_openai_and_learn(self, question):
+        """
+        Lấy câu trả lời từ OpenAI và thực hiện tính năng tự học.
+        """
+        general_chain = self.general_prompt | self.llm | StrOutputParser()
+        answer_text = general_chain.invoke({"question": question})
+
+        # --- TÍNH NĂNG TỰ HỌC ---
+        try:
+            print("INFO: Adding new knowledge to the database with 'pending' status...")
+            new_content = f"Question: {question}\nAnswer: {answer_text}"
+            new_metadata = {"source": "OpenAI_Generated_Q&A", "status": "pending"}
+            
+            self.vector_store.add_texts(
+                texts=[new_content],
+                metadatas=[new_metadata]
+            )
+            print("INFO: Successfully added new knowledge with 'pending' status.")
+        except Exception as e:
+            print(f"ERROR: Could not add new knowledge to database: {e}")
+        # --- KẾT THÚC TÍNH NĂNG TỰ HỌC ---
+
+        return {
+            "answer": answer_text,
+            "sources": [{"source": "OpenAI", "page": None}] 
+        }
